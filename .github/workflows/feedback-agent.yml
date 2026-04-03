@@ -1,0 +1,29 @@
+name: Claude feedback agent
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            A community member opened this GitHub Issue:
+            Title: ${{ github.event.issue.title }}
+            Body: ${{ github.event.issue.body }}
+            Author: ${{ github.event.issue.user.login }}
+
+            1. Read the codebase to understand the project
+            2. Post a comment on the issue that includes:
+               - Acknowledgement of the request
+               - Your assessment: is this feasible? How complex?
+               - A rough implementation plan (3-5 bullet points)
+               - What files would need to change
+            3. Apply the appropriate label: "bug", "enhancement", "question", or "good first issue"
+            4. If it's a small, well-defined change: open a draft PR implementing it
+          claude_args: "--max-turns 20 --allowedTools Bash,Write,Read,Edit"

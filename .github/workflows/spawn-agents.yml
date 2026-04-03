@@ -1,0 +1,180 @@
+name: Spawn Claude agents on approval
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  check-label:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'approved'
+    outputs:
+      idea_title: ${{ steps.extract.outputs.title }}
+      idea_body: ${{ steps.extract.outputs.body }}
+      repo_name: ${{ steps.extract.outputs.repo_name }}
+    steps:
+      - id: extract
+        run: |
+          TITLE="${{ github.event.issue.title }}"
+          REPO_NAME=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "${{ github.event.issue.body }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+
+  create-repo:
+    needs: check-label
+    runs-on: ubuntu-latest
+    outputs:
+      repo_url: ${{ steps.create.outputs.repo_url }}
+    steps:
+      - name: Create public repo from template
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh repo create ${{ github.repository_owner }}/${{ needs.check-label.outputs.repo_name }} \
+            --public \
+            --description "${{ needs.check-label.outputs.idea_title }}" \
+            --template ${{ github.repository_owner }}/withclaude-project-template
+          echo "repo_url=https://github.com/${{ github.repository_owner }}/${{ needs.check-label.outputs.repo_name }}" >> $GITHUB_OUTPUT
+
+      - name: Update issue with building status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue edit ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --add-label building \
+            --remove-label approved
+
+  ui-agent:
+    needs: [check-label, create-repo]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ needs.check-label.outputs.repo_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the UI Design Agent. The community approved this idea:
+            Title: ${{ needs.check-label.outputs.idea_title }}
+            Description: ${{ needs.check-label.outputs.idea_body }}
+
+            Create a file `design/UI.md` that includes:
+            1. User flow (step-by-step what users do)
+            2. Screen breakdown (list every screen/page needed)
+            3. Component hierarchy (what components each screen needs)
+            4. Color palette and typography decisions
+            5. Wireframe descriptions for each main screen (text-based ASCII or markdown tables)
+
+            Commit this file with message "design: UI specification from UI agent"
+          claude_args: "--max-turns 10"
+
+  design-system-agent:
+    needs: [check-label, create-repo]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ needs.check-label.outputs.repo_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the Design System Agent. The community approved this idea:
+            Title: ${{ needs.check-label.outputs.idea_title }}
+
+            Create a file `design/DESIGN_SYSTEM.md` that includes:
+            1. Design tokens (colors, spacing, typography, border radius)
+            2. Tailwind config extensions needed
+            3. Core shared components list (Button, Card, Input, etc.)
+            4. shadcn/ui components to install
+            5. Dark mode strategy
+
+            Also create `design/tokens.ts` with the actual TypeScript token definitions.
+            Commit both files with message "design: design system from design-system agent"
+          claude_args: "--max-turns 10"
+
+  eng-agent:
+    needs: [check-label, create-repo, ui-agent, design-system-agent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ needs.check-label.outputs.repo_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the Engineering Agent. The community approved this idea:
+            Title: ${{ needs.check-label.outputs.idea_title }}
+            Description: ${{ needs.check-label.outputs.idea_body }}
+
+            Read the design files in design/UI.md and design/DESIGN_SYSTEM.md first.
+
+            Then:
+            1. Scaffold a Next.js 14 app with TypeScript and Tailwind
+            2. Implement the core screens described in the UI spec
+            3. Use shadcn/ui components as specified in the design system
+            4. Add placeholder data/mock API responses where real data would go
+            5. Make sure `npm run build` passes
+            6. Open a PR titled "feat: initial implementation from eng agent"
+          claude_args: "--max-turns 30 --allowedTools Bash,Write,Read,Edit"
+
+  docs-agent:
+    needs: [check-label, create-repo, eng-agent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ needs.check-label.outputs.repo_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the Docs Agent. Read the entire repo then:
+
+            1. Write a complete README.md including:
+               - What this project does (from the idea)
+               - Features list
+               - One-click deploy buttons (Vercel, Railway, Fly.io, Render)
+               - Local development setup
+               - Tech stack
+               - Contributing guide link
+               - License badge
+
+            2. Write CONTRIBUTING.md explaining how community members can contribute
+            3. Ensure deploy/vercel.json, deploy/railway.toml, deploy/fly.toml exist with correct config
+
+            The README must include these exact badge buttons:
+            [![Deploy on Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=REPO_URL)
+            [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=REPO_URL)
+            [![Deploy on Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+
+            Replace REPO_URL with the actual repo URL.
+            Commit with message "docs: README and deploy configs from docs agent"
+          claude_args: "--max-turns 15"
+
+  mark-shipped:
+    needs: [check-label, docs-agent]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark idea as shipped
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue edit ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --add-label shipped \
+            --remove-label building
+          gh issue comment ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --body "This idea has been shipped! Check it out: https://github.com/${{ github.repository_owner }}/${{ needs.check-label.outputs.repo_name }}"
